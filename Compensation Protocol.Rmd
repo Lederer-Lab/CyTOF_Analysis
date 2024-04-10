@@ -1,0 +1,164 @@
+---
+title: "Compensation Protocol"
+author: "Alec Griffith"
+date: "9/10/2020"
+output:
+  word_document:
+    reference_docx: reference.docx
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Running code
+This code can be copied and pasted chunk by chunk into R to run each step. Alternatively: you can open the Compensation Protocol.Rmd file in the folder and run each chunk from there by pressing the green triangle in each chunk.
+
+```{r image, echo=FALSE, fig.cap="Rmarkdown play button", out.width='200%'}
+##### If you're running the Rmd file, you can skip this chunk
+knitr::include_graphics("rmarkdownplay.png")
+```
+
+## Loading required packages
+These packages are required for the compensation script. If they're not already downloaded, the first two (CATALYST and flowCore) need to be downloaded using
+```{r install example, eval=FALSE}
+BiocManager::install("CATALYST")
+```
+or
+```{r install example2, eval=FALSE}
+BiocManager::install("flowCore")
+```
+The rest can be installed using
+```{r install example3, eval=FALSE}
+install("package name")
+```
+
+Once all packages are installed, load their libraries
+
+```{r loading packages, results='hide', message=FALSE, warning=FALSE}
+library(CATALYST)
+library(flowCore)
+library(nnls)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(magrittr)
+```
+
+## Finding files
+These next lines are for you to select (in this order):  
+
+1) the single stained beads FCS file
+1) the folder with the FCS files you want compensated (recommended: remove any non FCS files from this folder)
+1) the folder you want the compensated files saved in  
+
+  
+```{r file selection}
+path_to_ss_beads <- choose.files(caption = "Select single stain")
+path_to_fcs <- choose.dir(caption = "Select raw FCS")
+out_path <- choose.dir(caption = "Select output Directory")
+```
+
+## Setting mass channels
+This sets the single stained channels for your bead file you can use ":" to indicate consecutive numbers (example: 141:143 = 141, 142, 143). This also sets the 190BCKG channel.  
+
+**Start here if you are re-running failed compensation**
+
+```{r setting mass channels}
+bc_ms <- c(89,102,104:106,108,110,111:116,120,141:176,193:196,198,209)
+custom_isotope_list <- c(CATALYST::isotope_list, list(BCKG=190))
+```
+
+## Prepare single stained beads and generate a spillover matrix
+This creates the spillover matrix from your single stained beads. *This will take some time depending on the size of your bead file.* To set your own cuttofs (instead of the estimated ones) remove "estCutoffs" from the "applyCutoffs" function and add "cutoff="
+
+```{r debarcode and create spillover matrix}
+singstain <- prepData(path_to_ss_beads)
+singstain <- assignPrelim(singstain, bc_ms, verbose=F)
+singstain <- applyCutoffs(estCutoffs(singstain))
+singstain <- computeSpillmat(singstain)
+sm <- metadata(singstain)$spillover_matrix
+```
+
+Note: If you want to create a csv of your spillover matrix you can use
+```{r writing csv, eval=FALSE}
+write.csv(sm, path="spillover.csv")
+```
+
+## Check the spillover matrix
+These next lines check the spillover matrix to make sure that  
+
+1) the diagonal values are all equal to 1
+1) the spillover values are all between 0 and 1  
+
+If one of these returns FALSE the compensation will fail. You can use the graph in the next chunk (plot cutoffs) to see which mass channel is causing the compensation to fail
+
+```{r checking spillover matrix}
+chs <- channels(singstain)
+ss_chs <- chs[rowData(singstain)$is_bc]
+all(diag(sm[ss_chs, ss_chs]) == 1)
+all(sm >= 0 & sm <= 1)
+```
+
+## Plotting single stain cuttofs
+This plot will show the yields for each mass channel, use it to determine which metals are causing compensation to fail
+
+```{r plot cuttofs}
+p1 <- plotYields(singstain)
+df <- ggplot_build(p1)$data[[2]]
+pal <- unique(df$colour)
+df$group <- as.factor(df$group)
+df$group <- mapvalues(df$group, from = unique(df$group), to = ss_chs)
+df$y[which(is.na(df$y))] <- 0
+p1 <- ggplot(data=df, mapping= aes(x=x, y=y/max(y), group=group))
+p2 <- p1 + geom_line(mapping = aes(color=group)) + theme_minimal()
+p3 <- p2 + scale_color_manual(breaks = unique(df$group), values=pal) + theme(legend.position = "none")
+p4 <- p3 + xlab("Barcode Separation") + ylab("Yield") + scale_y_continuous(labels = scales::percent)
+p4 + geom_text(data = df %>% dplyr::filter(x==0.5|x==0.25), mapping = aes(label=group, color = group), check_overlap = T)
+```
+
+If there is a metal you would like to remove, do so in the "setting mass channels" chunk
+
+## Checking debarcode matrix
+Use this to create a plot of the spillover values.  
+*If it doesn't plot all of your channels it is okay, it has a size cutoff*
+
+```{r spillover matrix plot}
+plotSpillmat(singstain, isotope_list = custom_isotope_list)
+```
+
+## Compensating the files
+This runs the actual compensation for your files. 
+
+```{r compensate}
+uncomped <- prepData(path_to_fcs, emptyValue = F)
+comped <- compCytof(uncomped,
+                    sm,
+                    method = "nnls",
+                    overwrite = T,
+                    isotope_list = custom_isotope_list)
+
+```
+
+## Writing compensated files
+If everything above has run without error this function will write the compensated files to the directory you selected
+
+```{r writing files, message=FALSE, results='hide'}
+fs <- sce2fcs(comped, split_by = "sample_id")
+filenames <- list.files(path_to_fcs)
+if(length(fs)>1){
+  for(i in 1:length(fs)){
+    write.FCS(x = fs[[i]],
+              filename = paste(out_path,
+                               "\\",
+                               strsplit(filenames[i],"\\.")[[1]][1],
+                               "_comped", ".fcs", sep = ""))
+  }
+}else{
+  write.FCS(x=fs, filename = paste(out_path,
+                                  "\\",
+                                  strsplit(filenames,"\\.")[[1]][1],
+                                  "_comped", ".fcs", sep = ""))
+}
+```
+
