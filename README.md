@@ -1,2 +1,2 @@
 # CyTOF_Analysis
-Scripts necessary for analysis of CyTOF data
+Required scripts for analyzing Mass Cytometry by Time-of-Flight (CyTOF)
