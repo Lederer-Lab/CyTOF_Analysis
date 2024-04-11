@@ -1,0 +1,249 @@
+---
+title: "CATALYST_Debarcoding_V2"
+author: "John Pulford"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Packages
+
+Load required packages to run script. If not already installed use install.packages("PACKAGE NAME") and run. Then run the chunk below.
+
+```{r loadpackages, include = FALSE }
+library(CATALYST)
+library(dplyr)
+library(tidyverse)
+library(cowplot)
+library(flowCore)
+library(ggplot2)
+library(SingleCellExperiment)
+```
+
+## Set Out Paths
+
+First set an outpath for the FCS files. This argument is called in one of the last chunks of the script.
+
+Next set an outpath for the various plots generated throughout the script.
+
+```{r setoutpath, include = TRUE}
+fcs_outpath <- "/Volumes/USB/Jack/Alloplex Runs 2023/AUGUST/2023-08-11 Alloplex Priority Patient Myeloid Panel/2023-08-22_Final_Presen_Run/FCS/"
+
+graph_outpath <- "/Volumes/USB/Jack/Alloplex Runs 2023/AUGUST/2023-08-11 Alloplex Priority Patient Myeloid Panel/2023-08-22_Final_Presen_Run/"
+```
+
+Import the RAW FCS file for processing and convert it to a Single Cell Experiment object class. prepData() will automatically concatenate multiple .FCS files if importing group.
+
+## Import Data
+
+```{r importdata, include = T }
+raw_data <- read.FCS("/Volumes/USB/Jack/Alloplex Runs 2023/AUGUST/2023-08-11 Alloplex Priority Patient Myeloid Panel/Compensated/XT_8_Processed_Concatenated_comped.fcs")
+(sce <- prepData(raw_data))
+```
+
+View total number of counts within file. Cells will be compiled into one sample if using concatenated file from DFCI CyTOF Core.
+
+```{r viewfilecounts, include =TRUE}
+# view number of events per sample
+table(sce$sample_id)
+```
+
+Import 6c3 barcode key with sample names added to corresponding BC channels. Note that this must be in .CSV format. The chunk will set the column types to numeric after import.
+
+```{r importbarcodeschemecsv, include = TRUE }
+bc_key <- read.csv(
+  "/Volumes/USB/Jack/Alloplex Runs 2023/AUGUST/2023-08-11 Alloplex Priority Patient Myeloid Panel/Barcode_Key_B1.csv",
+  header=TRUE, 
+  row.names = 1, 
+)
+
+bc_key <- bc_key %>% 
+  rename("102" = 1, "104" = 2, "105" = 3, "106" = 4, "108" = 5, "110" = 6)
+
+print(sapply(bc_key, class))
+
+bc_key$"102" = as.numeric(as.integer(bc_key$"102")) 
+bc_key$"104" = as.numeric(as.integer(bc_key$"104")) 
+bc_key$"105" = as.numeric(as.integer(bc_key$"105")) 
+bc_key$"106" = as.numeric(as.integer(bc_key$"106")) 
+bc_key$"108" = as.numeric(as.integer(bc_key$"108")) 
+bc_key$"110" = as.numeric(as.integer(bc_key$"110")) 
+
+print(sapply(bc_key, class))
+```
+
+Check the barcode key for proper formatting. Each sample should be positive for only 3 BC channels. If output = FALSE then check the .CSV file for errors.
+
+```{r QCbckey, include = TRUE}
+# all barcodes are positive for exactly 3 barcoding channels
+all(rowSums(bc_key) == 3)
+```
+
+Optional chunk for when not all barcode channels are utilized. May be redundant considering unused barcoding channels are not added to the cell suspension during CyTOF stain.
+
+\#`{r removeunusedbarcodechannels, include = TRUE} # remove empty barcodes from debarcoding scheme #is_empty <- grepl("empty", rownames(bc_key)) #bc_key <- bc_key[!is_empty, ] #bc_ids <- rownames(bc_key) #`
+
+## Assign Preliminary BC ID 
+
+Assign preliminary BC id to each cell event. All values are scaled using arcsinH-transformed BC expression values.
+
+```{r assignprelim, include = TRUE}
+system.time(sce <- assignPrelim(sce, bc_key))
+table(sce$bc_id)
+```
+
+Calculate the number of unassigned events after preliminary BC assignment. FALSE value = events assigned to a sample. TRUE = unassigned events stored in sample "0". Can use these values to calculate an initial yield before cutoff assignment.
+
+```{r calculateunassignedevents, include = TRUE}
+# tabulate number of (un)assigned events
+table(sce$bc_id == 0)
+```
+
+## Estimate Cutoffs
+
+Initial Cutoff estimation function. The separation values for each sample are calculated using the scaled 95th expression percentiles of each barcode population. Separation value is computed as the distance between the highest negative and lowest positive barcode channel.
+
+Cutoff estimates are calculated using this separation value. Chunk below will estimate cutoffs and return the value for each sample.
+
+```{r estimatecutoffs, include = TRUE}
+# estimate separation cutoffs
+sce <- estCutoffs(sce)
+# view separation cutoff estimates
+metadata(sce)$sep_cutoffs
+```
+
+Plots of the estimated cutoff are generated below and saved to directory specified in graph_outpath object. These cutoffs are not applied to our dataset at this time and the plots are simply to visually inspect the data.
+
+## Plot Estimated Yield
+
+Yields will typically start with a weak initial decline, with a second rapid decline towards zero. Between these two "peaks" are a "valley" where low numbers of counts with intermediate barcode separation. In order to provide a balance between high cell yield and low event assignment, the estimated cutoff should fall near the middle of the "valley".
+
+```{r plotyields, include = TRUE}
+plotYields(sce, which = c(0, "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38", "39", "40"), out_path = graph_outpath, out_name = "Final_B2_ _estimated_yield_plot")
+```
+
+Chunk below assigns the preliminary BC IDS to an object. We will use this to compare the event assignment before and after applying our cutoff values.
+
+```{r saveprelimbcids, include = TRUE}
+# store preliminary barcode IDs
+bc_ids0 <- sce$bc_id
+```
+
+## Calculating Cutoffs
+
+CATALYST provides us the option of using a global cutoff for all our samples in a dataset or applying sample specific cutoffs to each. Determining which cutoff better suits the dataset is up to the user.
+
+-   Global cutoffs are better suited to barcoding channels that decline in a synchronous fashion (peaks and valleys are relatively similar).
+
+-   Specific cutoffs are better suited to datasets whose barcode separation declines in an asynchronous fashion between samples.
+
+Users may modify cutoff values by changing values in sce_glob \<- sep_cutoffs = "0.15".
+
+-   decreasing the cutoff value will increase cell yield but may include less "pure" event assignments.
+
+-   Increasing the cutoff value will decrease cell yield but result in a more stringent and "pure" event population.
+
+```{r applycutoffs, include = TRUE}
+# apply global & sample-specific separation cutoff(s)
+sce_glob <- applyCutoffs(sce, sep_cutoffs = 0.15, mhl_cutoff = 30)
+sce_spec <- applyCutoffs(sce, mhl_cutoff = 30)
+```
+
+Cell yields for cutoff value comparison are generated and returned.
+
+```{r comparecutoffs, include = TRUE}
+# compare cell yields for both cutoff strategies
+c(global = mean(sce_glob$bc_id == 0),
+ specific = mean(sce_spec$bc_id == 0))
+```
+
+## Apply Cutoffs
+
+Proceed with filtering using desired cutoff value. Chunk must be modified with object names for global (sce_glob) or specific (sce_spec) filtering.
+
+```{r applydesiredcutoff, include = TRUE}
+# proceed with sample-specific filtering
+sce <- sce_spec
+```
+
+## Compare Event Assignment Before vs. After Cutoff
+
+Generate boxplot of event assignment before and after cutoff application on a sample basis. Note that unassigned events (sample 0) will increase after cutoff application since more events are being excluded from samples with a cutoff value.
+
+```{r eventassgnmentcomparison, include=TRUE}
+# compute number of events per population
+# before vs. after applying separation cutoffs
+barplot(rbind(table(bc_ids0), table(sce$bc_id)),
+   beside = TRUE, ylab = "cell count",
+   las = 2, cex.axis = 0.5, cex.names = 0.5)
+legend("topright", fill = c("darkgrey", "darkgreen"),
+   legend = c("before filtering", "after filtering"))
+```
+
+Generate, return, and save plots of all samples with their applied cutoff values and yields. yields will often be in the high 90 to 100% range but this is misleading. Not truly 100% yield because we are filtering out the events whose separation does not emet our cutoff value.
+
+```{r plotyieldswithnewcutoff, include = TRUE}
+plotYields(sce, which = c(0, "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38", "39", "40"), out_path = graph_outpath, out_name = "  Final_B2_Run_actual_yield_global_cutoff_plot")
+```
+
+## Final Sample Event Assignment
+
+Save final sample event counts to an object.
+
+```{r viewcounts, include =TRUE}
+# view number of events per sample; Sample 0 are unassgined events 
+Final_Counts <- table(sce$bc_id)
+```
+
+Write CSV of sample event assignments. Will need to manually input a path in the file = argument.
+
+```{r finalcountscsv, include = TRUE}
+write.csv(Final_Counts, file = "graph_outpath")
+```
+
+Remove unassigned events from the dataset. Do not run this chunk if you would like the unassigned events to be saved in an FCS file. Unassigned FCS file will be denoted as sample 0
+
+```{r removeunassignedevents, include = TRUE}
+# remove unassigned events
+sce <- sce[, sce$bc_id != 0]
+```
+
+Event plots for all samples, useful for understanding barcode ion assignment for each sample. Optional chunk.
+
+```{r plotnormalizedintensities, include=TRUE}
+# event plots for unassigned events
+# & barcode population D1
+plotEvents(sce, which = c(0, "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38", "39", "40"), out_path = graph_outpath, out_name = "Final_B2_Global_Cutoff_Event_Plot", n = 25)
+```
+
+## Write FCS Files
+
+Run all 3 chunks below to generate individual FCS files for the experiment. Will save the files to directory specified in FCS outpath set at the beginning of the script.
+
+```{r prepflowframe, include=TRUE}
+# exclude unassigned events
+#sce <- sce[, sce$bc_id != 0]
+# convert to 'flowSet' with one frame per sample
+(fs <- sce2fcs(sce, split_by = "bc_id"))
+```
+
+```{r checkeventassignment, include = TRUE}
+all(c(fsApply(fs, nrow)) == table(sce$bc_id))
+```
+
+```{r writefcsbysample, include=TRUE}
+# get sample identifiers
+ids <- fsApply(fs, identifier)
+for (id in ids) {
+    ff <- fs[[id]] # subset 'flowFrame'
+    fn <- sprintf("sample_%s.fcs", id) # specify output name that includes ID
+    fn <- file.path(fcs_outpath, fn)# construct output path
+    write.FCS(ff, fn) # write frame to FCS
+}
+
+```
